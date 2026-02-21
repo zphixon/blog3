@@ -1,0 +1,385 @@
+use anyhow::Result;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use chrono::{DateTime, Datelike, FixedOffset, Local};
+use serde_json::json;
+use sqlx::{SqliteConnection, SqlitePool};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use tera::Tera;
+use tokio::net::TcpListener;
+use tracing::info;
+use uuid::Uuid;
+
+macro_rules! fatal {
+    ($($arg:tt)*) => {{
+        ::tracing::error!($($arg)*);
+        ::anyhow::bail!($($arg)*);
+    }};
+}
+
+#[derive(Debug, ts_rs::TS, serde::Serialize, sqlx::FromRow)]
+#[ts(export)]
+struct Post {
+    id: Uuid,
+    title: String,
+    subtitle: Option<String>,
+    published: DateTime<FixedOffset>,
+    content: String,
+}
+
+impl Post {
+    fn slug(&self) -> String {
+        let short = if self.title.len() > 26 {
+            &self.title[..26]
+        } else {
+            &self.title
+        };
+
+        slug::slugify(short)
+            + &format!(
+                "-{:04}-{:02}-{:02}",
+                self.published.year(),
+                self.published.month(),
+                self.published.day()
+            )
+    }
+}
+
+const DOT_DIR: &str = ".blog3";
+
+#[derive(Debug, serde::Deserialize)]
+struct Config {
+    page_root: String,
+    bind: SocketAddr,
+    database: PathBuf,
+}
+
+impl Config {
+    fn route(&self, child: &str) -> String {
+        self.page_root.clone() + child
+    }
+
+    fn route_dot(&self, child: &str) -> String {
+        self.page_root.clone() + "/" + DOT_DIR + child
+    }
+}
+
+struct App {
+    config: Config,
+    pool: SqlitePool,
+    tera: Tera,
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+    run().await.unwrap();
+}
+
+const PAGE_TEMPLATE: &str = "page";
+
+async fn run() -> Result<()> {
+    let Some(config) = std::env::args().nth(1) else {
+        fatal!("missing config path filename");
+    };
+    let config = tokio::fs::read_to_string(config).await?;
+    let config: Config = match toml::from_str(&config) {
+        Ok(config) => config,
+        Err(err) => fatal!("{}", err),
+    };
+    info!("{:#?}", config);
+
+    let mut app = App {
+        pool: SqlitePool::connect(&format!("sqlite:{}", config.database.display())).await?,
+        tera: Tera::default(),
+        config,
+    };
+
+    app.tera.add_raw_template(
+        PAGE_TEMPLATE,
+        include_str!("../frontend/src/page.html.tera"),
+    )?;
+
+    let bind = app.config.bind.clone();
+
+    let router = Router::new()
+        .route(&app.config.route_dot("/assets/{item}"), get(assets_handler))
+        .route(&app.config.route_dot("/publish"), post(publish_handler))
+        .route(
+            &app.config.route_dot("/publish/{update}"),
+            post(publish_handler),
+        )
+        .route(&app.config.route("/edit/{page}"), get(edit_handler))
+        .route(&app.config.route("/page/{slug}"), get(page_handler))
+        .with_state(Arc::new(app));
+
+    let listener = TcpListener::bind(bind).await?;
+    axum::serve(listener, router).await?;
+
+    Ok(())
+}
+
+async fn assets_handler(State(app): State<Arc<App>>, Path(item): Path<String>) -> Response {
+    "ok".into_response()
+}
+
+#[derive(Debug, ts_rs::TS, serde::Deserialize)]
+#[ts(export)]
+struct Publish {
+    title: String,
+    subtitle: Option<String>,
+    content: String,
+}
+
+#[tracing::instrument(skip_all)]
+async fn publish_handler(
+    State(app): State<Arc<App>>,
+    update: Option<Path<Uuid>>,
+    Json(to_publish): Json<Publish>,
+) -> Response {
+    match update {
+        None => {
+            let post = Post {
+                id: Uuid::new_v4(),
+                title: to_publish.title,
+                subtitle: to_publish.subtitle,
+                published: Local::now().fixed_offset(),
+                content: to_publish.content,
+            };
+
+            tracing::trace!(new_post = ?post);
+
+            let mut tx = match app.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) => {
+                    tracing::error!(new_post_transaction = %err);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                }
+            };
+
+            if let Err(err) = app.insert_post(&mut *tx, &post).await {
+                tracing::error!(insert_post = %err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+
+            // insert a slug
+            let slug = post.slug();
+            let posts_with_slug = match app.count_ids_with_similar_slugs(&mut *tx, &slug).await {
+                Ok(slug) => slug,
+                Err(err) => {
+                    tracing::error!(new_post_slug = %err);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                }
+            };
+
+            let slug = if posts_with_slug > 0 {
+                format!("{slug}-{posts_with_slug}")
+            } else {
+                slug
+            };
+
+            if let Err(err) = app.insert_slug(&mut *tx, &slug, post.id).await {
+                tracing::error!(insert_slug = %err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+
+            if let Err(err) = tx.commit().await {
+                tracing::error!(new_post_transaction_commit = %err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+
+            Json(json!({ "id": post.id, "slug": slug })).into_response()
+        }
+
+        Some(Path(update)) => {
+            let mut tx = match app.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) => {
+                    tracing::error!(update_post_transaction = %err);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                }
+            };
+
+            match app.find_post(&mut *tx, update).await {
+                Ok(Some(existing)) => {
+                    tracing::trace!(update_existing = %update);
+
+                    // have an existing post, copy it into old. TODO make this not a json string
+                    if let Err(err) = app.insert_old(&mut *tx, &existing).await {
+                        tracing::error!(insert_old = %err);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response();
+                    };
+
+                    let new_post = Post {
+                        id: existing.id,
+                        title: to_publish.title,
+                        subtitle: to_publish.subtitle,
+                        published: Local::now().fixed_offset(),
+                        content: to_publish.content,
+                    };
+
+                    // update the existing post
+                    if let Err(err) = app.update_post(&mut *tx, &new_post).await {
+                        tracing::error!(update_existing = %err);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response();
+                    }
+
+                    let slug = new_post.slug();
+                    let ids_with_slug = match app.find_ids_with_similar_slugs(&mut *tx, &slug).await
+                    {
+                        Ok(posts) => posts,
+                        Err(err) => {
+                            tracing::error!(new_post_slug = %err);
+                            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                                .into_response();
+                        }
+                    };
+
+                    let renaming_to_new_slug = !ids_with_slug.contains_key(&new_post.id);
+
+                    tracing::trace!(try_slug = %slug, ids_with_slug = ?ids_with_slug, ?renaming_to_new_slug);
+
+                    let slug = if ids_with_slug.len() > 0 && renaming_to_new_slug {
+                        format!("{slug}-{}", ids_with_slug.len())
+                    } else if !renaming_to_new_slug {
+                        // SAFETY: should already exist if we're renaming to an existing slug
+                        ids_with_slug[&new_post.id].clone()
+                    } else {
+                        slug
+                    };
+
+                    tracing::trace!(updated_slug = %slug);
+
+                    if renaming_to_new_slug
+                        && let Err(err) = app.insert_slug(&mut *tx, &slug, new_post.id).await
+                    {
+                        tracing::error!(update_slug = %err);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response();
+                    };
+
+                    if let Err(err) = tx.commit().await {
+                        tracing::error!(update_post_transaction_commit = %err);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response();
+                    }
+
+                    Json(json!({ "id": new_post.id, "slug": slug })).into_response()
+                }
+
+                // passed a uuid in the path but the post with that uuid didn't exist
+                Ok(None) => {
+                    tracing::trace!(not_found = %update);
+                    (StatusCode::NOT_FOUND, "post not found").into_response()
+                }
+
+                Err(err) => {
+                    tracing::error!(select_existing = %err);
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+            }
+        }
+    }
+}
+
+async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) {}
+
+async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) {}
+
+impl App {
+    async fn insert_post(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        sqlx::query!(
+            "insert into post (id, title, subtitle, published, content) values ($1, $2, $3, $4, $5)",
+            post.id,
+            post.title,
+            post.subtitle,
+            post.published,
+            post.content,
+        )
+        .execute(conn)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn insert_slug(&self, conn: &mut SqliteConnection, slug: &str, id: Uuid) -> Result<()> {
+        sqlx::query!("insert into slug (slug, id) values ($1, $2)", slug, id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    async fn find_post(&self, conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Post>> {
+        let post = sqlx::query_as::<_, Post>("select * from post where id = $1 limit 1")
+            .bind(&id)
+            .fetch_optional(conn)
+            .await?;
+        Ok(post)
+    }
+
+    async fn insert_old(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        let old = serde_json::to_string(&post).expect("post is valid json");
+        sqlx::query!("insert into old (id, data) values ($1, $2)", post.id, old,)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_post(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        sqlx::query!(
+            r#"
+                update post
+                    set title = $1,
+                        subtitle = $2,
+                        published = $3,
+                        content = $4
+                    where id = $5
+            "#,
+            post.title,
+            post.subtitle,
+            post.published,
+            post.content,
+            post.id
+        )
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn count_ids_with_similar_slugs(
+        &self,
+        conn: &mut SqliteConnection,
+        slug: &str,
+    ) -> Result<usize> {
+        Ok(self.find_ids_with_similar_slugs(conn, slug).await?.len())
+    }
+
+    async fn find_ids_with_similar_slugs(
+        &self,
+        conn: &mut SqliteConnection,
+        slug: &str,
+    ) -> Result<HashMap<Uuid, String>> {
+        let slug_like = format!("{slug}%");
+
+        let row = sqlx::query!("select id, slug from slug where slug like $1", slug_like)
+            .fetch_all(conn)
+            .await?;
+
+        Ok(row
+            .into_iter()
+            .map(|row| {
+                (
+                    Uuid::from_slice(&row.id).expect("valid uuids in database"),
+                    row.slug,
+                )
+            })
+            .collect())
+    }
+}
