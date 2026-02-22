@@ -1,0 +1,72 @@
+:root {
+  --bg: rgb(250, 255, 242);
+  --border: rgb(30, 48, 21);
+  --text: rgb(34, 55, 14);
+  --link: rgb(30, 103, 8);
+  --header: rgb(232, 249, 208);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: rgb(47, 74, 6);
+    --border: rgb(232, 255, 220);
+    --text: rgb(218, 239, 199);
+    --link: rgb(168, 235, 148);
+    --header: rgb(38, 66, 0);
+  }
+}
+
+body {
+  color: var(--text);
+  background-color: var(--bg);
+}
+a, a:visited {
+  color: var(--link);
+}
+
+.datetime {
+  margin-left: 1rem;
+  opacity: 50%;
+}
+
+.datetime.inRows {
+  display: flex;
+  flex-direction: column;
+}
+
+.datetime .date, .datetime .time {
+  text-wrap: nowrap;
+}
+
+.datetime .time {
+  align-self: end;
+}
+
+@media (min-width: 650px) {
+  body {
+    margin-left: 5rem;
+    margin-right: 5rem;
+  }
+}
+
+#indexPosts .post {
+  border-radius: 8px;
+  background-color: var(--header);
+  padding: 0.5rem 1rem;
+  margin-bottom: 0.5rem;
+  display: grid;
+  grid-template-columns: 1fr fit-content(20%);
+
+  .postTitle {
+    font-size: x-large;
+  }
+
+  .postSubtitle {
+    font-size: large;
+  }
+
+  .postPublished {
+    justify-self: right;
+    align-content: end;
+  }
+}

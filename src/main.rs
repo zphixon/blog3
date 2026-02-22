@@ -15,7 +15,7 @@ use serde_json::json;
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 use tera::{Context, Tera};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::RwLock};
 use tracing::info;
 use uuid::Uuid;
 
@@ -33,8 +33,7 @@ macro_rules! return_500 {
     }};
 }
 
-#[derive(Debug, ts_rs::TS, serde::Serialize, sqlx::FromRow)]
-#[ts(export)]
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
 struct Post {
     id: Uuid,
     title: String,
@@ -82,18 +81,40 @@ struct BasicAuthConfig {
 
 impl Config {
     fn route(&self, child: &str) -> String {
-        self.page_root.clone() + child
+        if self.page_root == "/" {
+            String::from(child)
+        } else {
+            self.page_root.clone() + child
+        }
     }
 
     fn route_dot(&self, child: &str) -> String {
-        self.page_root.clone() + "/" + DOT_DIR + child
+        if self.page_root == "/" {
+            String::from("/") + DOT_DIR + child
+        } else {
+            self.page_root.clone() + "/" + DOT_DIR + child
+        }
     }
 }
 
 struct App {
     config: Config,
     pool: SqlitePool,
-    tera: Tera,
+    tera: RwLock<Tera>,
+}
+
+impl App {
+    #[tracing::instrument(skip(self, context))]
+    async fn render(&self, template_name: &str, context: &Context) -> Result<String> {
+        #[cfg(debug_assertions)]
+        {
+            tracing::debug!("reloading");
+            self.tera.write().await.full_reload()?;
+        }
+
+        tracing::trace!("rendering");
+        Ok(self.tera.read().await.render(template_name, context)?)
+    }
 }
 
 #[tokio::main]
@@ -102,35 +123,46 @@ async fn main() {
     run().await.unwrap();
 }
 
-const POST_TEMPLATE: &str = "post";
-const INDEX_TEMPLATE: &str = "index";
+const POST_TEMPLATE: &str = "post.html.tera";
+const INDEX_TEMPLATE: &str = "index.html.tera";
 
 async fn run() -> Result<()> {
     let Some(config) = std::env::args().nth(1) else {
         fatal!("missing config path filename");
     };
     let config = tokio::fs::read_to_string(config).await?;
-    let config: Config = match toml::from_str(&config) {
+    let mut config: Config = match toml::from_str(&config) {
         Ok(config) => config,
         Err(err) => fatal!("{}", err),
     };
+    config.page_root = String::from("/") + config.page_root.trim_matches('/');
+
     info!("{:#?}", config);
 
-    let mut app = App {
+    let app = App {
         pool: SqlitePool::connect(&format!("sqlite:{}", config.database.display())).await?,
-        tera: Tera::default(),
+        tera: if cfg!(debug_assertions) {
+            RwLock::new(
+                Tera::new("frontend/*.tera")
+                    .inspect_err(|err| println!("{}", err))
+                    .expect("valid templates"),
+            )
+        } else {
+            RwLock::new(Tera::default())
+        },
         config,
     };
 
-    app.tera.add_raw_template(
-        POST_TEMPLATE,
-        include_str!("../frontend/src/post.html.tera"),
-    )?;
-
-    app.tera.add_raw_template(
-        INDEX_TEMPLATE,
-        include_str!("../frontend/src/index.html.tera"),
-    )?;
+    if !cfg!(debug_assertions) {
+        app.tera
+            .write()
+            .await
+            .add_raw_template(POST_TEMPLATE, include_str!("../frontend/post.html.tera"))?;
+        app.tera
+            .write()
+            .await
+            .add_raw_template(INDEX_TEMPLATE, include_str!("../frontend/index.html.tera"))?;
+    }
 
     let bind = app.config.bind.clone();
     let app = Arc::new(app);
@@ -157,7 +189,10 @@ async fn run() -> Result<()> {
     let listener = TcpListener::bind(bind).await?;
     axum::serve(
         listener,
-        Router::new().merge(authed_router).merge(unauthed_router),
+        Router::new()
+            .merge(authed_router)
+            .merge(unauthed_router)
+            .fallback(fallback_handler),
     )
     .await?;
 
@@ -209,6 +244,17 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
 
         ($name:literal => $content_type:literal $file:literal $cache:literal) => {
             if item == $name {
+                ::tracing::trace!(content_type = %$content_type, cache = %$cache);
+
+                if cfg!(debug_assertions) {
+                    ::tracing::debug!("reading");
+                    return (
+                        [("Content-Type", $content_type)],
+                        ::tokio::fs::read(format!("frontend/{}", $file)).await.expect($file),
+                    )
+                        .into_response();
+                }
+
                 return (
                     [
                         ("Content-Type", $content_type),
@@ -221,13 +267,8 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
         };
     }
 
-    response!("post.js" => "text/javascript" "../frontend/build/post.js" "max-age=3600, must-revalidate");
-    response!("post.css" => "text/css" "../frontend/src/post.css" "max-age=3600, must-revalidate");
-
-    response!("index.js" => "text/javascript" "../frontend/build/index.js" "max-age=3600, must-revalidate");
-    response!("index.css" => "text/css" "../frontend/src/index.css" "max-age=3600, must-revalidate");
-
-    response!("jsx-runtime.js" => "text/javascript" "../frontend/build/jsx-runtime.js" "max-age=3600, must-revalidate");
+    response!("post.css" => "text/css" "../frontend/post.css" "max-age=3600, must-revalidate");
+    response!("index.css" => "text/css" "../frontend/index.css" "max-age=3600, must-revalidate");
 
     response!("apple-touch-icon.png" => "image/png" "../frontend/assets/apple-touch-icon.png");
     response!("favicon-96x96.png" => "image/png" "../frontend/assets/favicon-96x96.png");
@@ -236,18 +277,11 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
     response!("web-app-manifest-192x192.png" => "image/png" "../frontend/assets/web-app-manifest-192x192.png");
     response!("web-app-manifest-512x512.png" => "image/png" "../frontend/assets/web-app-manifest-512x512.png");
 
-    #[cfg(debug_assertions)]
-    {
-        response!("post.js.map" => "text/javascript" "../frontend/build/post.js.map");
-        response!("index.js.map" => "text/javascript" "../frontend/build/index.js.map");
-        response!("jsx-runtime.js.map" => "text/javascript" "../frontend/build/jsx-runtime.js.map");
-    }
-
+    tracing::debug!("not found");
     StatusCode::NOT_FOUND.into_response()
 }
 
-#[derive(Debug, ts_rs::TS, serde::Deserialize)]
-#[ts(export)]
+#[derive(Debug, serde::Deserialize)]
 struct Publish {
     title: String,
     subtitle: Option<String>,
@@ -385,8 +419,7 @@ async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) -> 
     "edit".into_response()
 }
 
-#[derive(sqlx::FromRow, serde::Serialize, ts_rs::TS)]
-#[ts(export)]
+#[derive(sqlx::FromRow, serde::Serialize)]
 struct Recent {
     slug: String,
     title: String,
@@ -410,14 +443,14 @@ async fn index_handler(State(app): State<Arc<App>>) -> Response {
     {
         Ok(posts) => {
             let mut context = Context::new();
-            context.insert("index_title", &app.config.title);
+            context.insert("blog_title", &app.config.title);
             context.insert("page_root", &app.config.page_root);
             context.insert("posts", &posts);
-            match app.tera.render(INDEX_TEMPLATE, &context) {
+            match app.render(INDEX_TEMPLATE, &context).await {
                 Ok(rendered) => Html(rendered).into_response(),
                 Err(err) => return_500!(err, render_index),
             }
-        },
+        }
         Err(err) => return_500!(err, select_recent_posts),
     }
 }
@@ -447,10 +480,11 @@ async fn post_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> 
                 Ok(Some(post)) => {
                     let mut context = Context::new();
 
+                    context.insert("blog_title", &app.config.title);
                     context.insert("post", &post);
                     context.insert("page_root", &app.config.page_root);
 
-                    match app.tera.render(POST_TEMPLATE, &context) {
+                    match app.render(POST_TEMPLATE, &context).await {
                         Ok(rendered) => Html(rendered).into_response(),
                         Err(err) => {
                             tracing::error!(render_page = ?err, post = %id, %slug);
@@ -620,4 +654,9 @@ impl App {
 
         Ok(())
     }
+}
+
+async fn fallback_handler(request: axum::extract::Request) -> Response {
+    tracing::debug!(not_found = %request.uri());
+    StatusCode::NOT_FOUND.into_response()
 }

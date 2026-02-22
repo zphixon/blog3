@@ -1,0 +1,27 @@
+{%- import "macros.html.tera" as m -%}
+
+<!DOCTYPE html>
+<html>
+  <head>
+    {{ m::meta() }}
+    <title>{{ blog_title }}</title>
+  </head>
+  <body>
+    <h1>{{ blog_title }}</h1>
+    <div id="indexPosts">
+      {% for post in posts %}
+        <div id="{{ post.slug }}" class="post">
+          <span class="postTitle">
+            <a href="{{ m::p(p=post.slug) }}">{{ post.title }}</a>
+            {% if post.subtitle %}
+              <br>
+              <span class="postSubtitle">{{ post.subtitle }}</span>
+            {% endif %}
+          </span>
+          <div class="postPublished datetime inRows">{{ post.published }}</div>
+        </div>
+      {% endfor %}
+    </div>
+    {{ m::datetime() }}
+  </body>
+</html>
