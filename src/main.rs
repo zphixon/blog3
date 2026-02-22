@@ -125,7 +125,7 @@ async fn run() -> Result<()> {
         .route(&app.config.route_dot("/publish"), post(publish_handler))
         .route(
             &app.config.route_dot("/publish/{update}"),
-            post(publish_handler),
+            post(update_handler),
         )
         .route(&app.config.route("/edit/{page}"), get(edit_handler))
         .layer(axum::middleware::from_fn_with_state(
@@ -229,158 +229,151 @@ struct Publish {
 #[tracing::instrument(skip_all)]
 async fn publish_handler(
     State(app): State<Arc<App>>,
-    update: Option<Path<Uuid>>,
     Json(to_publish): Json<Publish>,
 ) -> Response {
-    match update {
-        None => {
-            let post = Post {
-                id: Uuid::new_v4(),
+    let post = Post {
+        id: Uuid::new_v4(),
+        title: to_publish.title,
+        subtitle: to_publish.subtitle,
+        published: Local::now().fixed_offset(),
+        content: to_publish.content,
+    };
+
+    tracing::trace!(new_post = ?post);
+
+    let mut tx = match app.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(new_post_transaction = %err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+    };
+
+    if let Err(err) = app.insert_post(&mut *tx, &post).await {
+        tracing::error!(insert_post = %err);
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+
+    // insert a slug
+    let slug = post.slug();
+    let posts_with_slug = match app.count_ids_with_similar_slugs(&mut *tx, &slug).await {
+        Ok(slug) => slug,
+        Err(err) => {
+            tracing::error!(new_post_slug = %err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+    };
+
+    let slug = if posts_with_slug > 0 {
+        format!("{slug}-{posts_with_slug}")
+    } else {
+        slug
+    };
+
+    if let Err(err) = app.insert_slug(&mut *tx, &slug, post.id).await {
+        tracing::error!(insert_slug = %err);
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(new_post_transaction_commit = %err);
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+
+    Json(json!({ "id": post.id, "slug": slug })).into_response()
+}
+
+#[tracing::instrument(skip_all)]
+async fn update_handler(
+    State(app): State<Arc<App>>,
+    Path(update): Path<Uuid>,
+    Json(to_publish): Json<Publish>,
+) -> Response {
+    let mut tx = match app.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(update_post_transaction = %err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+    };
+
+    match app.find_post(&mut *tx, update).await {
+        Ok(Some(existing)) => {
+            tracing::trace!(update_existing = %update);
+
+            // have an existing post, copy it into old. TODO make this not a json string
+            if let Err(err) = app.insert_old(&mut *tx, &existing).await {
+                tracing::error!(insert_old = %err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            };
+
+            let new_post = Post {
+                id: existing.id,
                 title: to_publish.title,
                 subtitle: to_publish.subtitle,
                 published: Local::now().fixed_offset(),
                 content: to_publish.content,
             };
 
-            tracing::trace!(new_post = ?post);
-
-            let mut tx = match app.pool.begin().await {
-                Ok(tx) => tx,
-                Err(err) => {
-                    tracing::error!(new_post_transaction = %err);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-                }
-            };
-
-            if let Err(err) = app.insert_post(&mut *tx, &post).await {
-                tracing::error!(insert_post = %err);
+            // update the existing post
+            if let Err(err) = app.update_post(&mut *tx, &new_post).await {
+                tracing::error!(update_existing = %err);
                 return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
             }
 
-            // insert a slug
-            let slug = post.slug();
-            let posts_with_slug = match app.count_ids_with_similar_slugs(&mut *tx, &slug).await {
-                Ok(slug) => slug,
+            let slug = new_post.slug();
+            let ids_with_slug = match app.find_ids_with_similar_slugs(&mut *tx, &slug).await {
+                Ok(posts) => posts,
                 Err(err) => {
                     tracing::error!(new_post_slug = %err);
                     return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
                 }
             };
 
-            let slug = if posts_with_slug > 0 {
-                format!("{slug}-{posts_with_slug}")
+            let renaming_to_new_slug = !ids_with_slug.contains_key(&new_post.id);
+
+            tracing::trace!(try_slug = %slug, ids_with_slug = ?ids_with_slug, ?renaming_to_new_slug);
+
+            let slug = if ids_with_slug.len() > 0 && renaming_to_new_slug {
+                format!("{slug}-{}", ids_with_slug.len())
+            } else if !renaming_to_new_slug {
+                // SAFETY: should already exist if we're renaming to an existing slug
+                ids_with_slug[&new_post.id].clone()
             } else {
                 slug
             };
 
-            if let Err(err) = app.insert_slug(&mut *tx, &slug, post.id).await {
-                tracing::error!(insert_slug = %err);
+            tracing::trace!(updated_slug = %slug);
+
+            if renaming_to_new_slug
+                && let Err(err) = app.insert_slug(&mut *tx, &slug, new_post.id).await
+            {
+                tracing::error!(update_slug = %err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            };
+
+            if let Err(err) = app.update_old_slugs(&mut *tx, new_post.id, &slug).await {
+                tracing::error!(update_old_slug = %err);
                 return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
             }
 
             if let Err(err) = tx.commit().await {
-                tracing::error!(new_post_transaction_commit = %err);
+                tracing::error!(update_post_transaction_commit = %err);
                 return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
             }
 
-            Json(json!({ "id": post.id, "slug": slug })).into_response()
+            Json(json!({ "id": new_post.id, "slug": slug })).into_response()
         }
 
-        Some(Path(update)) => {
-            let mut tx = match app.pool.begin().await {
-                Ok(tx) => tx,
-                Err(err) => {
-                    tracing::error!(update_post_transaction = %err);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-                }
-            };
+        // passed a uuid in the path but the post with that uuid didn't exist
+        Ok(None) => {
+            tracing::trace!(not_found = %update);
+            (StatusCode::NOT_FOUND, "post not found").into_response()
+        }
 
-            match app.find_post(&mut *tx, update).await {
-                Ok(Some(existing)) => {
-                    tracing::trace!(update_existing = %update);
-
-                    // have an existing post, copy it into old. TODO make this not a json string
-                    if let Err(err) = app.insert_old(&mut *tx, &existing).await {
-                        tracing::error!(insert_old = %err);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response();
-                    };
-
-                    let new_post = Post {
-                        id: existing.id,
-                        title: to_publish.title,
-                        subtitle: to_publish.subtitle,
-                        published: Local::now().fixed_offset(),
-                        content: to_publish.content,
-                    };
-
-                    // update the existing post
-                    if let Err(err) = app.update_post(&mut *tx, &new_post).await {
-                        tracing::error!(update_existing = %err);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response();
-                    }
-
-                    let slug = new_post.slug();
-                    let ids_with_slug = match app.find_ids_with_similar_slugs(&mut *tx, &slug).await
-                    {
-                        Ok(posts) => posts,
-                        Err(err) => {
-                            tracing::error!(new_post_slug = %err);
-                            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                                .into_response();
-                        }
-                    };
-
-                    let renaming_to_new_slug = !ids_with_slug.contains_key(&new_post.id);
-
-                    tracing::trace!(try_slug = %slug, ids_with_slug = ?ids_with_slug, ?renaming_to_new_slug);
-
-                    let slug = if ids_with_slug.len() > 0 && renaming_to_new_slug {
-                        format!("{slug}-{}", ids_with_slug.len())
-                    } else if !renaming_to_new_slug {
-                        // SAFETY: should already exist if we're renaming to an existing slug
-                        ids_with_slug[&new_post.id].clone()
-                    } else {
-                        slug
-                    };
-
-                    tracing::trace!(updated_slug = %slug);
-
-                    if renaming_to_new_slug
-                        && let Err(err) = app.insert_slug(&mut *tx, &slug, new_post.id).await
-                    {
-                        tracing::error!(update_slug = %err);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response();
-                    };
-
-                    if let Err(err) = app.update_old_slugs(&mut *tx, new_post.id, &slug).await {
-                        tracing::error!(update_old_slug = %err);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response();
-                    }
-
-                    if let Err(err) = tx.commit().await {
-                        tracing::error!(update_post_transaction_commit = %err);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response();
-                    }
-
-                    Json(json!({ "id": new_post.id, "slug": slug })).into_response()
-                }
-
-                // passed a uuid in the path but the post with that uuid didn't exist
-                Ok(None) => {
-                    tracing::trace!(not_found = %update);
-                    (StatusCode::NOT_FOUND, "post not found").into_response()
-                }
-
-                Err(err) => {
-                    tracing::error!(select_existing = %err);
-                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-                }
-            }
+        Err(err) => {
+            tracing::error!(select_existing = %err);
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
 }
