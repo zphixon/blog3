@@ -18,12 +18,12 @@ export default {
   input: Object.fromEntries([
     ...doGlob("src/**/*.ts"),
     ...doGlob("src/**/*.tsx"),
-    ...doGlob("src/**/*.svg")
   ]),
   output: {
     dir: "./build",
     format: "es",
     sourcemap: true,
+    chunkFileNames: "[name].js",
   },
   plugins: [
     replace({

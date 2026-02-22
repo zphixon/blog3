@@ -1,8 +1,4 @@
 page_root = "/blog3"
 bind = "0.0.0.0:16100"
 database = "example.sqlite3"
-
-[basic_auth]
-user = "zack"
-password = "1"
-realm = "glopernaut.org"
+title = "My coo l  blog"

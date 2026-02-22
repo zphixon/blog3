@@ -26,6 +26,13 @@ macro_rules! fatal {
     }};
 }
 
+macro_rules! return_500 {
+    ($err:expr, $errname:ident) => {{
+        ::tracing::error!($errname = ?$err);
+        return (::axum::http::StatusCode::INTERNAL_SERVER_ERROR, $err.to_string()).into_response()
+    }};
+}
+
 #[derive(Debug, ts_rs::TS, serde::Serialize, sqlx::FromRow)]
 #[ts(export)]
 struct Post {
@@ -61,6 +68,7 @@ struct Config {
     page_root: String,
     bind: SocketAddr,
     database: PathBuf,
+    title: String,
     #[serde(default)]
     basic_auth: Option<BasicAuthConfig>,
 }
@@ -94,7 +102,8 @@ async fn main() {
     run().await.unwrap();
 }
 
-const PAGE_TEMPLATE: &str = "page";
+const POST_TEMPLATE: &str = "post";
+const INDEX_TEMPLATE: &str = "index";
 
 async fn run() -> Result<()> {
     let Some(config) = std::env::args().nth(1) else {
@@ -114,8 +123,13 @@ async fn run() -> Result<()> {
     };
 
     app.tera.add_raw_template(
-        PAGE_TEMPLATE,
-        include_str!("../frontend/src/page.html.tera"),
+        POST_TEMPLATE,
+        include_str!("../frontend/src/post.html.tera"),
+    )?;
+
+    app.tera.add_raw_template(
+        INDEX_TEMPLATE,
+        include_str!("../frontend/src/index.html.tera"),
     )?;
 
     let bind = app.config.bind.clone();
@@ -134,18 +148,23 @@ async fn run() -> Result<()> {
         ))
         .with_state(app.clone());
 
-    let router = Router::new()
+    let unauthed_router = Router::new()
         .route(&app.config.route_dot("/assets/{item}"), get(assets_handler))
-        .route(&app.config.route("/{slug}"), get(page_handler))
-        .with_state(app.clone())
-        .merge(authed_router);
+        .route(&app.config.route("/"), get(index_handler))
+        .route(&app.config.route("/{slug}"), get(post_handler))
+        .with_state(app.clone());
 
     let listener = TcpListener::bind(bind).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        Router::new().merge(authed_router).merge(unauthed_router),
+    )
+    .await?;
 
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 async fn basic_auth_layer(
     State(app): State<Arc<App>>,
     basic_auth: Option<TypedHeader<Authorization<Basic>>>,
@@ -155,9 +174,10 @@ async fn basic_auth_layer(
     match (app.config.basic_auth.as_ref(), basic_auth) {
         (Some(BasicAuthConfig { user, password, .. }), Some(TypedHeader(header))) => {
             if header.username() == user && header.password() == password {
-                tracing::trace!("Successful basic auth");
+                tracing::trace!(successful_basic = ?user);
                 next.run(request).await
             } else {
+                tracing::debug!(unsuccessful_basic = ?user);
                 (StatusCode::UNAUTHORIZED, "Incorrect username/password").into_response()
             }
         }
@@ -179,6 +199,7 @@ async fn basic_auth_layer(
     }
 }
 
+#[tracing::instrument]
 async fn assets_handler(Path(item): Path<String>) -> Response {
     // 1 year by default
     macro_rules! response {
@@ -200,8 +221,13 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
         };
     }
 
-    response!("page.js" => "text/javascript" "../frontend/build/page.js" "max-age=3600, must-revalidate");
-    response!("page.css" => "text/css" "../frontend/src/page.css" "max-age=3600, must-revalidate");
+    response!("post.js" => "text/javascript" "../frontend/build/post.js" "max-age=3600, must-revalidate");
+    response!("post.css" => "text/css" "../frontend/src/post.css" "max-age=3600, must-revalidate");
+
+    response!("index.js" => "text/javascript" "../frontend/build/index.js" "max-age=3600, must-revalidate");
+    response!("index.css" => "text/css" "../frontend/src/index.css" "max-age=3600, must-revalidate");
+
+    response!("jsx-runtime.js" => "text/javascript" "../frontend/build/jsx-runtime.js" "max-age=3600, must-revalidate");
 
     response!("apple-touch-icon.png" => "image/png" "../frontend/assets/apple-touch-icon.png");
     response!("favicon-96x96.png" => "image/png" "../frontend/assets/favicon-96x96.png");
@@ -212,7 +238,9 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
 
     #[cfg(debug_assertions)]
     {
-        response!("page.js.map" => "text/javascript" "../frontend/build/page.js.map")
+        response!("post.js.map" => "text/javascript" "../frontend/build/post.js.map");
+        response!("index.js.map" => "text/javascript" "../frontend/build/index.js.map");
+        response!("jsx-runtime.js.map" => "text/javascript" "../frontend/build/jsx-runtime.js.map");
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -227,10 +255,7 @@ struct Publish {
 }
 
 #[tracing::instrument(skip_all)]
-async fn publish_handler(
-    State(app): State<Arc<App>>,
-    Json(to_publish): Json<Publish>,
-) -> Response {
+async fn publish_handler(State(app): State<Arc<App>>, Json(to_publish): Json<Publish>) -> Response {
     let post = Post {
         id: Uuid::new_v4(),
         title: to_publish.title,
@@ -239,29 +264,22 @@ async fn publish_handler(
         content: to_publish.content,
     };
 
-    tracing::trace!(new_post = ?post);
+    tracing::debug!(new_post = ?post);
 
     let mut tx = match app.pool.begin().await {
         Ok(tx) => tx,
-        Err(err) => {
-            tracing::error!(new_post_transaction = %err);
-            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-        }
+        Err(err) => return_500!(err, new_post_transaction),
     };
 
     if let Err(err) = app.insert_post(&mut *tx, &post).await {
-        tracing::error!(insert_post = %err);
-        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        return_500!(err, insert_post);
     }
 
     // insert a slug
     let slug = post.slug();
     let posts_with_slug = match app.count_ids_with_similar_slugs(&mut *tx, &slug).await {
         Ok(slug) => slug,
-        Err(err) => {
-            tracing::error!(new_post_slug = %err);
-            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-        }
+        Err(err) => return_500!(err, new_post_slug),
     };
 
     let slug = if posts_with_slug > 0 {
@@ -271,13 +289,11 @@ async fn publish_handler(
     };
 
     if let Err(err) = app.insert_slug(&mut *tx, &slug, post.id).await {
-        tracing::error!(insert_slug = %err);
-        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        return_500!(err, insert_slug);
     }
 
     if let Err(err) = tx.commit().await {
-        tracing::error!(new_post_transaction_commit = %err);
-        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        return_500!(err, new_post_transaction_commit);
     }
 
     Json(json!({ "id": post.id, "slug": slug })).into_response()
@@ -291,20 +307,16 @@ async fn update_handler(
 ) -> Response {
     let mut tx = match app.pool.begin().await {
         Ok(tx) => tx,
-        Err(err) => {
-            tracing::error!(update_post_transaction = %err);
-            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-        }
+        Err(err) => return_500!(err, update_post_transaction),
     };
 
     match app.find_post(&mut *tx, update).await {
         Ok(Some(existing)) => {
-            tracing::trace!(update_existing = %update);
+            tracing::debug!(update_existing = %update);
 
             // have an existing post, copy it into old. TODO make this not a json string
             if let Err(err) = app.insert_old(&mut *tx, &existing).await {
-                tracing::error!(insert_old = %err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                return_500!(err, insert_old);
             };
 
             let new_post = Post {
@@ -317,17 +329,13 @@ async fn update_handler(
 
             // update the existing post
             if let Err(err) = app.update_post(&mut *tx, &new_post).await {
-                tracing::error!(update_existing = %err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                return_500!(err, update_existing);
             }
 
             let slug = new_post.slug();
             let ids_with_slug = match app.find_ids_with_similar_slugs(&mut *tx, &slug).await {
                 Ok(posts) => posts,
-                Err(err) => {
-                    tracing::error!(new_post_slug = %err);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
-                }
+                Err(err) => return_500!(err, new_post_slug),
             };
 
             let renaming_to_new_slug = !ids_with_slug.contains_key(&new_post.id);
@@ -348,18 +356,15 @@ async fn update_handler(
             if renaming_to_new_slug
                 && let Err(err) = app.insert_slug(&mut *tx, &slug, new_post.id).await
             {
-                tracing::error!(update_slug = %err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                return_500!(err, update_slug);
             };
 
             if let Err(err) = app.update_old_slugs(&mut *tx, new_post.id, &slug).await {
-                tracing::error!(update_old_slug = %err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                return_500!(err, update_old_slug);
             }
 
             if let Err(err) = tx.commit().await {
-                tracing::error!(update_post_transaction_commit = %err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                return_500!(err, update_post_transaction_commit);
             }
 
             Json(json!({ "id": new_post.id, "slug": slug })).into_response()
@@ -371,18 +376,54 @@ async fn update_handler(
             (StatusCode::NOT_FOUND, "post not found").into_response()
         }
 
-        Err(err) => {
-            tracing::error!(select_existing = %err);
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(err) => return_500!(err, select_existing),
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) -> Response {
     "edit".into_response()
 }
 
-async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> Response {
+#[derive(sqlx::FromRow, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+struct Recent {
+    slug: String,
+    title: String,
+    subtitle: Option<String>,
+    published: DateTime<FixedOffset>,
+}
+
+async fn index_handler(State(app): State<Arc<App>>) -> Response {
+    match sqlx::query_as::<_, Recent>(
+        r#"
+            select slug, title, subtitle, published
+            from post
+            join slug on post.id = slug.id
+            group by post.id
+            order by published desc
+            limit 50
+        "#,
+    )
+    .fetch_all(&app.pool)
+    .await
+    {
+        Ok(posts) => {
+            let mut context = Context::new();
+            context.insert("index_title", &app.config.title);
+            context.insert("page_root", &app.config.page_root);
+            context.insert("posts", &posts);
+            match app.tera.render(INDEX_TEMPLATE, &context) {
+                Ok(rendered) => Html(rendered).into_response(),
+                Err(err) => return_500!(err, render_index),
+            }
+        },
+        Err(err) => return_500!(err, select_recent_posts),
+    }
+}
+
+#[tracing::instrument(skip_all)]
+async fn post_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> Response {
     let mut tx = match app.pool.begin().await {
         Ok(tx) => tx,
         Err(err) => {
@@ -409,7 +450,7 @@ async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> 
                     context.insert("post", &post);
                     context.insert("page_root", &app.config.page_root);
 
-                    match app.tera.render(PAGE_TEMPLATE, &context) {
+                    match app.tera.render(POST_TEMPLATE, &context) {
                         Ok(rendered) => Html(rendered).into_response(),
                         Err(err) => {
                             tracing::error!(render_page = ?err, post = %id, %slug);
@@ -441,6 +482,8 @@ async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> 
 
 impl App {
     async fn insert_post(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        tracing::trace!(insert_post = %post.id);
+
         sqlx::query!(
             "insert into post (id, title, subtitle, published, content) values ($1, $2, $3, $4, $5)",
             post.id,
@@ -456,6 +499,7 @@ impl App {
     }
 
     async fn insert_slug(&self, conn: &mut SqliteConnection, slug: &str, id: Uuid) -> Result<()> {
+        tracing::trace!(insert_slug = ?slug, post = %id);
         sqlx::query!("insert into slug (slug, id) values ($1, $2)", slug, id)
             .execute(conn)
             .await?;
@@ -467,6 +511,8 @@ impl App {
         conn: &mut SqliteConnection,
         slug: &str,
     ) -> Result<Option<(Uuid, String)>> {
+        tracing::trace!(get_newest_slug = ?slug);
+
         let row = sqlx::query!("select id, newslug from slug where slug = $1", slug)
             .fetch_optional(conn)
             .await?;
@@ -480,22 +526,31 @@ impl App {
     }
 
     async fn find_post(&self, conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Post>> {
+        tracing::trace!(find_post = %id);
+
         let post = sqlx::query_as::<_, Post>("select * from post where id = $1 limit 1")
             .bind(&id)
             .fetch_optional(conn)
             .await?;
+
         Ok(post)
     }
 
     async fn insert_old(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        tracing::trace!(insert_old = %post.id);
+
         let old = serde_json::to_string(&post).expect("post is valid json");
+
         sqlx::query!("insert into old (id, data) values ($1, $2)", post.id, old,)
             .execute(conn)
             .await?;
+
         Ok(())
     }
 
     async fn update_post(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
+        tracing::trace!(update_post = %post.id);
+
         sqlx::query!(
             r#"
                 update post
@@ -513,6 +568,7 @@ impl App {
         )
         .execute(conn)
         .await?;
+
         Ok(())
     }
 
@@ -524,11 +580,14 @@ impl App {
         Ok(self.find_ids_with_similar_slugs(conn, slug).await?.len())
     }
 
+    #[tracing::instrument(skip_all)]
     async fn find_ids_with_similar_slugs(
         &self,
         conn: &mut SqliteConnection,
         slug: &str,
     ) -> Result<HashMap<Uuid, String>> {
+        tracing::trace!(find_similar_slugs = %slug);
+
         let slug_like = format!("{slug}%");
 
         let row = sqlx::query!("select id, slug from slug where slug like $1", slug_like)
@@ -546,12 +605,15 @@ impl App {
             .collect())
     }
 
+    #[tracing::instrument(skip_all)]
     async fn update_old_slugs(
         &self,
         conn: &mut SqliteConnection,
         id: Uuid,
         new_slug: &str,
     ) -> Result<()> {
+        tracing::trace!(update_old_slugs = %id, ?new_slug);
+
         sqlx::query!("update slug set newslug = $1 where id = $2", new_slug, id)
             .execute(conn)
             .await?;
