@@ -265,6 +265,12 @@ async fn publish_handler(
                             .into_response();
                     };
 
+                    if let Err(err) = app.update_old_slugs(&mut *tx, new_post.id, &slug).await {
+                        tracing::error!(update_old_slug = %err);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response();
+                    }
+
                     if let Err(err) = tx.commit().await {
                         tracing::error!(update_post_transaction_commit = %err);
                         return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -381,5 +387,18 @@ impl App {
                 )
             })
             .collect())
+    }
+
+    async fn update_old_slugs(
+        &self,
+        conn: &mut SqliteConnection,
+        id: Uuid,
+        new_slug: &str,
+    ) -> Result<()> {
+        sqlx::query!("update slug set newslug = $1 where id = $2", new_slug, id)
+            .execute(conn)
+            .await?;
+
+        Ok(())
     }
 }
