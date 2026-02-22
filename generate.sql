@@ -1,8 +1,4 @@
-drop table if exists post;
-drop table if exists old;
-drop table if exists slug;
-
-create table post (
+create table if not exists post (
     id blob unique not null primary key,
     title text not null,
     subtitle text,
@@ -10,13 +6,13 @@ create table post (
     content text not null
 );
 
-create table old (
+create table if not exists old (
     id blob not null,
     data text,
     foreign key (id) references post (id)
 );
 
-create table slug (
+create table if not exists slug (
     slug text unique not null primary key,
     id blob not null,
     newslug text,

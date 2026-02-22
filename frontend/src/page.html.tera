@@ -4,7 +4,7 @@
     <meta charset="utf8" />
     <link rel="icon" type="image/png" href="{{ page_root }}/.blog3/assets/favicon-96x96.png" sizes="96x96" />
     <link rel="icon" type="image/svg+xml" href="{{ page_root }}/.blog3/assets/favicon.svg" />
-    <title>{{ tab_title }}</title>
+    <title>{{ post.title }}</title>
     <link rel="stylesheet" href="{{ page_root }}/.blog3/assets/page.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1, minimal-ui">
   </head>
@@ -24,6 +24,7 @@
         </div>
       </div>
     </div>
+    <script id="post" type="application/json">{{ post | json_encode() }}</script>
     <script type="module" src="{{ page_root }}/.blog3/assets/page.js"></script>
   </body>
 </html>

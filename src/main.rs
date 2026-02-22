@@ -3,14 +3,18 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
+};
+use axum_extra::{
+    TypedHeader,
+    headers::{Authorization, authorization::Basic},
 };
 use chrono::{DateTime, Datelike, FixedOffset, Local};
 use serde_json::json;
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
-use tera::Tera;
+use tera::{Context, Tera};
 use tokio::net::TcpListener;
 use tracing::info;
 use uuid::Uuid;
@@ -57,6 +61,15 @@ struct Config {
     page_root: String,
     bind: SocketAddr,
     database: PathBuf,
+    #[serde(default)]
+    basic_auth: Option<BasicAuthConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BasicAuthConfig {
+    user: String,
+    password: String,
+    realm: Option<String>,
 }
 
 impl Config {
@@ -106,17 +119,26 @@ async fn run() -> Result<()> {
     )?;
 
     let bind = app.config.bind.clone();
+    let app = Arc::new(app);
 
-    let router = Router::new()
-        .route(&app.config.route_dot("/assets/{item}"), get(assets_handler))
+    let authed_router = Router::new()
         .route(&app.config.route_dot("/publish"), post(publish_handler))
         .route(
             &app.config.route_dot("/publish/{update}"),
             post(publish_handler),
         )
         .route(&app.config.route("/edit/{page}"), get(edit_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            basic_auth_layer,
+        ))
+        .with_state(app.clone());
+
+    let router = Router::new()
+        .route(&app.config.route_dot("/assets/{item}"), get(assets_handler))
         .route(&app.config.route("/{slug}"), get(page_handler))
-        .with_state(Arc::new(app));
+        .with_state(app.clone())
+        .merge(authed_router);
 
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, router).await?;
@@ -124,8 +146,76 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn assets_handler(State(app): State<Arc<App>>, Path(item): Path<String>) -> Response {
-    "ok".into_response()
+async fn basic_auth_layer(
+    State(app): State<Arc<App>>,
+    basic_auth: Option<TypedHeader<Authorization<Basic>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match (app.config.basic_auth.as_ref(), basic_auth) {
+        (Some(BasicAuthConfig { user, password, .. }), Some(TypedHeader(header))) => {
+            if header.username() == user && header.password() == password {
+                tracing::trace!("Successful basic auth");
+                next.run(request).await
+            } else {
+                (StatusCode::UNAUTHORIZED, "Incorrect username/password").into_response()
+            }
+        }
+
+        (Some(BasicAuthConfig { realm, .. }), None) => (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                &format!(
+                    "Basic realm=\"{}\"",
+                    realm.as_deref().unwrap_or("mycoolblog")
+                ),
+            )],
+            "Need auth",
+        )
+            .into_response(),
+
+        (None, _) => next.run(request).await,
+    }
+}
+
+async fn assets_handler(Path(item): Path<String>) -> Response {
+    // 1 year by default
+    macro_rules! response {
+        ($name:literal => $content_type:literal $file:literal) => {
+            response!($name => $content_type $file "max-age=31536000, immutable")
+        };
+
+        ($name:literal => $content_type:literal $file:literal $cache:literal) => {
+            if item == $name {
+                return (
+                    [
+                        ("Content-Type", $content_type),
+                        ("Cache-Control", $cache),
+                    ],
+                    include_bytes!($file),
+                )
+                    .into_response();
+            }
+        };
+    }
+
+    response!("page.js" => "text/javascript" "../frontend/build/page.js" "max-age=3600, must-revalidate");
+    response!("page.css" => "text/css" "../frontend/src/page.css" "max-age=3600, must-revalidate");
+
+    response!("apple-touch-icon.png" => "image/png" "../frontend/assets/apple-touch-icon.png");
+    response!("favicon-96x96.png" => "image/png" "../frontend/assets/favicon-96x96.png");
+    response!("favicon.ico" => "image/x-icon" "../frontend/assets/favicon.ico");
+    response!("favicon.svg" => "image/svg+xml" "../frontend/assets/favicon.svg");
+    response!("web-app-manifest-192x192.png" => "image/png" "../frontend/assets/web-app-manifest-192x192.png");
+    response!("web-app-manifest-512x512.png" => "image/png" "../frontend/assets/web-app-manifest-512x512.png");
+
+    #[cfg(debug_assertions)]
+    {
+        response!("page.js.map" => "text/javascript" "../frontend/build/page.js.map")
+    }
+
+    StatusCode::NOT_FOUND.into_response()
 }
 
 #[derive(Debug, ts_rs::TS, serde::Deserialize)]
@@ -320,11 +410,26 @@ async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> 
             }
 
             match app.find_post(&mut *tx, id).await {
-                Ok(Some(page)) => Json(page).into_response(),
+                Ok(Some(post)) => {
+                    let mut context = Context::new();
+
+                    context.insert("post", &post);
+                    context.insert("page_root", &app.config.page_root);
+
+                    match app.tera.render(PAGE_TEMPLATE, &context) {
+                        Ok(rendered) => Html(rendered).into_response(),
+                        Err(err) => {
+                            tracing::error!(render_page = ?err, post = %id, %slug);
+                            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                        }
+                    }
+                }
+
                 Ok(None) => {
                     tracing::error!(find_post_returned_nothing_wat = %id, %newslug, oldslug = %slug);
                     (StatusCode::INTERNAL_SERVER_ERROR, "page not in database?").into_response()
                 }
+
                 Err(err) => {
                     tracing::error!(page_handler_find_post = %err);
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
