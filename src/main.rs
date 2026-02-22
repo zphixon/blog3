@@ -115,7 +115,7 @@ async fn run() -> Result<()> {
             post(publish_handler),
         )
         .route(&app.config.route("/edit/{page}"), get(edit_handler))
-        .route(&app.config.route("/page/{slug}"), get(page_handler))
+        .route(&app.config.route("/{slug}"), get(page_handler))
         .with_state(Arc::new(app));
 
     let listener = TcpListener::bind(bind).await?;
@@ -295,9 +295,51 @@ async fn publish_handler(
     }
 }
 
-async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) {}
+async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) -> Response {
+    "edit".into_response()
+}
 
-async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) {}
+async fn page_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> Response {
+    let mut tx = match app.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(page_handler_transaction = %err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+    };
+
+    match app.get_newest_slug(&mut *tx, &slug).await {
+        Ok(Some((id, newslug))) => {
+            if newslug != slug {
+                tracing::debug!(redirected = %slug, to = %newslug);
+                return (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [("Location", app.config.route(&format!("/{newslug}")))],
+                )
+                    .into_response();
+            }
+
+            match app.find_post(&mut *tx, id).await {
+                Ok(Some(page)) => Json(page).into_response(),
+                Ok(None) => {
+                    tracing::error!(find_post_returned_nothing_wat = %id, %newslug, oldslug = %slug);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "page not in database?").into_response()
+                }
+                Err(err) => {
+                    tracing::error!(page_handler_find_post = %err);
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+            }
+        }
+
+        Ok(None) => (StatusCode::NOT_FOUND, "todo: nice 404 page").into_response(),
+
+        Err(err) => {
+            tracing::error!(get_newest_slug_page_handler = %err);
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+    }
+}
 
 impl App {
     async fn insert_post(&self, conn: &mut SqliteConnection, post: &Post) -> Result<()> {
@@ -320,6 +362,23 @@ impl App {
             .execute(conn)
             .await?;
         Ok(())
+    }
+
+    async fn get_newest_slug(
+        &self,
+        conn: &mut SqliteConnection,
+        slug: &str,
+    ) -> Result<Option<(Uuid, String)>> {
+        let row = sqlx::query!("select id, newslug from slug where slug = $1", slug)
+            .fetch_optional(conn)
+            .await?;
+
+        Ok(row.map(|row| {
+            (
+                Uuid::from_slice(&row.id).expect("valid uuids in database"),
+                row.newslug.unwrap_or_else(|| String::from(slug)),
+            )
+        }))
     }
 
     async fn find_post(&self, conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Post>> {
