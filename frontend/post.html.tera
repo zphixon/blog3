@@ -9,7 +9,6 @@
   </head>
   <body>
     {{ m::post_body(post=post) }}
-    <a href="{{ m::p(p='/') }}">home</a>
     {{ m::datetime() }}
   </body>
 </html>

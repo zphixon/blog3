@@ -55,4 +55,5 @@
       {{ post.content }}
     {%- endif -%}
   </div>
+  <a href="{{ self::p(p='/') }}">home</a>
 {%- endmacro -%}
