@@ -42,10 +42,12 @@
 
 {%- macro post_body(post) -%}
   <h1>{{ post.title }}</h1>
-  {% if post.subtitle %}
-    <em>{{ post.subtitle }}</em>
-  {% endif %}
-  <p id="postPublished" class="datetime">{{ post.published }}</p>
+  <div>
+    {% if post.subtitle %}
+      <em>{{ post.subtitle }}</em>
+    {% endif %}
+    <span id="postPublished" class="datetime">{{ post.published }}</span>
+  </div>
   <div class="markdown">
     {%- if post.content_rendered -%}
       {{ post.content_rendered }} 

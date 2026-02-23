@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     Json, Router, ServiceExt,
     extract::{Path, State},
-    http::{Request, StatusCode, Uri, uri::Builder},
+    http::{Request, StatusCode, uri::Builder},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -160,11 +160,19 @@ async fn run() -> Result<()> {
         app.tera
             .write()
             .await
+            .add_raw_template("macros.html.tera", include_str!("../frontend/macros.html.tera"))?;
+        app.tera
+            .write()
+            .await
             .add_raw_template(POST_TEMPLATE, include_str!("../frontend/post.html.tera"))?;
         app.tera
             .write()
             .await
             .add_raw_template(INDEX_TEMPLATE, include_str!("../frontend/index.html.tera"))?;
+        app.tera
+            .write()
+            .await
+            .add_raw_template(EDIT_TEMPLATE, include_str!("../frontend/edit.html.tera"))?;
     }
 
     let bind = app.config.bind.clone();

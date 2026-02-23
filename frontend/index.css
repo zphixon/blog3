@@ -42,10 +42,11 @@ a, a:visited {
   align-self: end;
 }
 
-@media (min-width: 650px) {
+@media (min-width: 1000px) {
   body {
-    margin-left: 5rem;
-    margin-right: 5rem;
+    margin-left: auto;
+    margin-right: auto;
+    max-width: 60rem;
   }
 }
 
