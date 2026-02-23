@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Json, Router, ServiceExt,
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode, Uri, uri::Builder},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,6 +16,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 use tera::{Context, Tera};
 use tokio::{net::TcpListener, sync::RwLock};
+use tower::Layer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -40,6 +41,7 @@ struct Post {
     subtitle: Option<String>,
     published: DateTime<FixedOffset>,
     content: String,
+    draft: bool,
 }
 
 impl Post {
@@ -125,6 +127,7 @@ async fn main() {
 
 const POST_TEMPLATE: &str = "post.html.tera";
 const INDEX_TEMPLATE: &str = "index.html.tera";
+const EDIT_TEMPLATE: &str = "edit.html.tera";
 
 async fn run() -> Result<()> {
     let Some(config) = std::env::args().nth(1) else {
@@ -173,7 +176,10 @@ async fn run() -> Result<()> {
             &app.config.route_dot("/publish/{update}"),
             post(update_handler),
         )
+        .route(&app.config.route("/drafts"), get(drafts_handler))
+        .route(&app.config.route("/edit"), get(edit_handler))
         .route(&app.config.route("/edit/{page}"), get(edit_handler))
+        .route(&app.config.route("/{page}/edit"), get(edit_handler))
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             basic_auth_layer,
@@ -182,21 +188,51 @@ async fn run() -> Result<()> {
 
     let unauthed_router = Router::new()
         .route(&app.config.route_dot("/assets/{item}"), get(assets_handler))
-        .route(&app.config.route("/"), get(index_handler))
+        .route(&app.config.page_root, get(index_handler))
         .route(&app.config.route("/{slug}"), get(post_handler))
         .with_state(app.clone());
+
+    let router = Router::new()
+        .merge(authed_router)
+        .merge(unauthed_router)
+        .fallback(fallback_handler);
 
     let listener = TcpListener::bind(bind).await?;
     axum::serve(
         listener,
-        Router::new()
-            .merge(authed_router)
-            .merge(unauthed_router)
-            .fallback(fallback_handler),
+        tower::util::MapRequestLayer::new(strip_trailing_slash)
+            .layer(router)
+            .into_make_service(),
     )
     .await?;
 
     Ok(())
+}
+
+fn strip_trailing_slash<B>(mut req: Request<B>) -> Request<B> {
+    if let Some(pandq) = req.uri().path_and_query() {
+        let trimmed = pandq.path().trim_end_matches("/");
+        if trimmed == pandq.path() || trimmed == "" {
+            return req;
+        }
+
+        let mut new_pandq = String::from(trimmed);
+
+        if let Some(query) = pandq.query() {
+            new_pandq += "?";
+            new_pandq += query;
+        }
+
+        if let Ok(new_uri) = Builder::from(req.uri().clone())
+            .path_and_query(new_pandq)
+            .build()
+        {
+            tracing::trace!(from = %req.uri(), to = %new_uri, "rewriting");
+            *req.uri_mut() = new_uri;
+        }
+    }
+
+    req
 }
 
 #[tracing::instrument(skip_all)]
@@ -284,8 +320,11 @@ async fn assets_handler(Path(item): Path<String>) -> Response {
 #[derive(Debug, serde::Deserialize)]
 struct Publish {
     title: String,
+    #[serde(default)]
     subtitle: Option<String>,
     content: String,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[tracing::instrument(skip_all)]
@@ -296,6 +335,7 @@ async fn publish_handler(State(app): State<Arc<App>>, Json(to_publish): Json<Pub
         subtitle: to_publish.subtitle,
         published: Local::now().fixed_offset(),
         content: to_publish.content,
+        draft: to_publish.draft,
     };
 
     tracing::debug!(new_post = ?post);
@@ -344,7 +384,7 @@ async fn update_handler(
         Err(err) => return_500!(err, update_post_transaction),
     };
 
-    match app.find_post(&mut *tx, update).await {
+    match app.find_post_uuid(&mut *tx, update).await {
         Ok(Some(existing)) => {
             tracing::debug!(update_existing = %update);
 
@@ -359,6 +399,7 @@ async fn update_handler(
                 subtitle: to_publish.subtitle,
                 published: Local::now().fixed_offset(),
                 content: to_publish.content,
+                draft: to_publish.draft,
             };
 
             // update the existing post
@@ -415,8 +456,108 @@ async fn update_handler(
 }
 
 #[tracing::instrument(skip_all)]
-async fn edit_handler(State(app): State<Arc<App>>, Path(page): Path<String>) -> Response {
-    "edit".into_response()
+async fn drafts_handler(State(app): State<Arc<App>>) -> Response {
+    match sqlx::query_as::<_, Recent>(
+        r#"
+            select slug, title, subtitle, published
+            from post
+            join slug on post.id = slug.id
+            where draft is true
+            group by post.id
+            order by published desc
+        "#,
+    )
+    .fetch_all(&app.pool)
+    .await
+    {
+        Ok(posts) => {
+            let mut context = Context::new();
+            context.insert("blog_title", &format!("Editing {}", app.config.title));
+            context.insert("page_root", &app.config.page_root);
+            context.insert("posts", &posts);
+            match app.render(INDEX_TEMPLATE, &context).await {
+                Ok(rendered) => Html(rendered).into_response(),
+                Err(err) => return_500!(err, render_index),
+            }
+        }
+        Err(err) => return_500!(err, select_recent_posts),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MaybePost {
+    id: Option<Uuid>,
+    title: String,
+    subtitle: Option<String>,
+    published: DateTime<FixedOffset>,
+    content: String,
+    content_rendered: String,
+    draft: bool,
+}
+
+#[tracing::instrument(skip_all)]
+async fn edit_handler(State(app): State<Arc<App>>, page: Option<Path<String>>) -> Response {
+    tracing::trace!(?page);
+
+    let post = match page {
+        Some(Path(uuid_or_slug)) => {
+            let uuid = match Uuid::parse_str(&uuid_or_slug) {
+                Ok(uuid) => uuid,
+                _ => {
+                    match sqlx::query!("select id from slug where slug = $1 limit 1", uuid_or_slug)
+                        .fetch_one(&app.pool)
+                        .await
+                    {
+                        Ok(row) => Uuid::from_slice(&row.id).expect("valid uuids in database"),
+                        Err(err) => return_500!(err, get_id_from_slug),
+                    }
+                }
+            };
+
+            match sqlx::query_as::<_, Post>("select * from post where id = $1 limit 1")
+                .bind(&uuid)
+                .fetch_one(&app.pool)
+                .await
+            {
+                Ok(post) => MaybePost {
+                    id: Some(post.id),
+                    title: post.title,
+                    subtitle: post.subtitle,
+                    published: post.published,
+                    content_rendered: markdown::to_html_with_options(
+                        &post.content,
+                        &markdown::Options::gfm(),
+                    )
+                    .expect("valid markdown"),
+                    content: post.content,
+                    draft: post.draft,
+                },
+                Err(err) => return_500!(err, get_post),
+            }
+        }
+
+        None => MaybePost {
+            id: None,
+            title: String::from("Draft post"),
+            subtitle: None,
+            published: Local::now().fixed_offset(),
+            content: String::from("some contents"),
+            content_rendered: markdown::to_html_with_options(
+                "preview will appear here",
+                &markdown::Options::gfm(),
+            )
+            .expect("valid markdown"),
+            draft: true,
+        },
+    };
+
+    let mut context = Context::new();
+    context.insert("page_root", &app.config.page_root);
+    context.insert("post", &post);
+    match app.render(EDIT_TEMPLATE, &context).await {
+        Ok(rendered) => Html(rendered).into_response(),
+        Err(err) => return_500!(err, render_index),
+    }
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
@@ -433,6 +574,7 @@ async fn index_handler(State(app): State<Arc<App>>) -> Response {
             select slug, title, subtitle, published
             from post
             join slug on post.id = slug.id
+            where draft is false
             group by post.id
             order by published desc
             limit 50
@@ -476,8 +618,23 @@ async fn post_handler(State(app): State<Arc<App>>, Path(slug): Path<String>) -> 
                     .into_response();
             }
 
-            match app.find_post(&mut *tx, id).await {
-                Ok(Some(post)) => {
+            match app.find_post_uuid(&mut *tx, id).await {
+                Ok(Some(mut post)) => {
+                    tracing::trace!(found_post = %post.id, slug = %newslug);
+
+                    if post.draft {
+                        tracing::debug!("redirecting to edit");
+                        return (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [("Location", app.config.route(&format!("/edit/{}", post.id)))],
+                        )
+                            .into_response();
+                    }
+
+                    post.content =
+                        markdown::to_html_with_options(&post.content, &markdown::Options::gfm())
+                            .expect("valid markdown");
+
                     let mut context = Context::new();
 
                     context.insert("blog_title", &app.config.title);
@@ -519,12 +676,13 @@ impl App {
         tracing::trace!(insert_post = %post.id);
 
         sqlx::query!(
-            "insert into post (id, title, subtitle, published, content) values ($1, $2, $3, $4, $5)",
+            "insert into post (id, title, subtitle, published, content, draft) values ($1, $2, $3, $4, $5, $6)",
             post.id,
             post.title,
             post.subtitle,
             post.published,
             post.content,
+            post.draft,
         )
         .execute(conn)
         .await?;
@@ -559,7 +717,7 @@ impl App {
         }))
     }
 
-    async fn find_post(&self, conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Post>> {
+    async fn find_post_uuid(&self, conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Post>> {
         tracing::trace!(find_post = %id);
 
         let post = sqlx::query_as::<_, Post>("select * from post where id = $1 limit 1")
@@ -591,14 +749,16 @@ impl App {
                     set title = $1,
                         subtitle = $2,
                         published = $3,
-                        content = $4
-                    where id = $5
+                        content = $4,
+                        draft = $5
+                    where id = $6
             "#,
             post.title,
             post.subtitle,
             post.published,
             post.content,
-            post.id
+            post.draft,
+            post.id,
         )
         .execute(conn)
         .await?;

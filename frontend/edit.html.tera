@@ -1,0 +1,65 @@
+{%- import "macros.html.tera" as m -%}
+
+<!DOCTYPE html>
+<html>
+  <head>
+    {{ m::meta() }}
+    <link rel="stylesheet" href="{{ self::p(p='/.blog3/assets/post.css') }}" />
+    <title>Editing {{ post.title }}</title>
+  </head>
+  <body>
+    <h1>Editing '{{ post.title }}'</h1>
+
+    <div>
+    <input id="title" type="text" value="{{ post.title }}">
+    <br>
+    <input id="subtitle" type="text" value="{{ post.subtitle }}">
+    <br>
+
+    <textarea id="postContent">{{ post.content }}</textarea>
+
+    <br>
+    <button id="saveDraftButton">save as draft</button>
+    <br>
+    <button id="publishButton">publish</button>
+
+    </div>
+
+    <p id="result"></p>
+
+    {{ m::post_body(post=post) }}
+
+    {{ m::datetime() }}
+
+    <script>
+      // {% if post.id %}
+      //   {% set publish = '/publish/' ~ post.id %}
+      // {% else %}
+      //   {% set publish = '/publish' %}
+      // {% endif %}
+
+      function doPublish(draft) {
+        fetch("{{ m::p(p='/.blog3' ~ publish) }}", {
+          method: "post",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: title.value,
+            subtitle: subtitle.value == "" ? undefined : subtitle.value,
+            content: postContent.value,
+            draft: draft,
+          }),
+        })
+        .then(response => response.json())
+        .then(response => {
+          // uhh
+          result.innerHTML = "<a href='{{ m::p(p='/') }}" + response.slug + "'>" + title.value + '</a>';
+        });
+      }
+
+      saveDraftButton.onclick = () => doPublish(true);
+      publishButton.onclick = () => doPublish(false);
+    </script>
+  </body>
+</html>

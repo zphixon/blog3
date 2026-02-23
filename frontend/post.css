@@ -1,3 +1,19 @@
 #postPublished {
   float: right;
 }
+
+.markdown h1 {
+  font-size: x-large;
+}
+
+.markdown h2 {
+  font-size: large;
+}
+
+.markdown h3 {
+  font-size: medium;
+}
+
+.markdown h4 {
+  font-size: small;
+}

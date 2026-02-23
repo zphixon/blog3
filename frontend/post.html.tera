@@ -8,15 +8,8 @@
     <title>{{ blog_title }} - {{ post.title }}</title>
   </head>
   <body>
-    <h1>{{ post.title }}</h1>
-    {% if post.subtitle %}
-      <em>{{ post.subtitle }}</em>
-    {% endif %}
-    <p id="postPublished" class="datetime">{{ post.published }}</p>
-
-    <p>{{ post.content }}</p>
+    {{ m::post_body(post=post) }}
     <a href="{{ m::p(p='/') }}">home</a>
-
     {{ m::datetime() }}
   </body>
 </html>

@@ -3,7 +3,8 @@ create table if not exists post (
     title text not null,
     subtitle text,
     published datetime not null,
-    content text not null
+    content text not null,
+    draft boolean not null default false
 );
 
 create table if not exists old (
